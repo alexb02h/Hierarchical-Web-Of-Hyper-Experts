@@ -1,5 +1,6 @@
 # *Hierarchical-Web-Of-Hyper-Experts*
-## Alexander J. Baron  Github: alexb02h
+## Alexander J. Baron  
+### Github: alexb02h
 
 Current neural networks suffer from *Catastrophic Forgetting*, where learning a new task inadvertently overwrites the representations acquired from previous tasks. This "monolithic" approach to learning prevents AI from achieving true lifelong learning and cumulative knowledge.
 
