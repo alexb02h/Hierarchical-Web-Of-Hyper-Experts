@@ -165,9 +165,10 @@ class EvolutionaryAudioGNN(nn.Module):
 		spec_id = f"spec_{self.specialist_id_counter}"
 		self.specialist_id_counter += 1
   
-		specialist = AudioSpecialist(spec_id, in_channels, out_channels)
+		specialist = AudioSpecialist(spec_id, in_channels, out_channels) 
+		print("Womp Womp")
 		self.specialists[spec_id] = specialist
-		self.graph.add_node(spec_id, channels=out_channels)
+		self.graph.add_node(spec_id, channels=out_channels) 
   
 		return spec_id
 
@@ -196,7 +197,7 @@ class EvolutionaryAudioGNN(nn.Module):
 		sig1 = self.specialists[spec_id1].get_behavioral_signature()
 		sig2 = self.specialists[spec_id2].get_behavioral_signature()
 
-		is sig1.shape != sig2.shape: return 0.0
+		if sig1.shape != sig2.shape: return 0.0
 
 		similarity = F.cosine_similarity(sig1.unsqueeze(0), sig2.unsqueeze(0))
 		return similarity.item()
@@ -287,15 +288,21 @@ class EvolutionaryTrainer:
         
         return improvement < threshold
     
-    def mutate_add_specialist(self, in_channels, out_channels):
-        new_id = self.model.add_specialist(in_channels, out_channels)
-        
+    def mutate_add_specialist(self, out_channels):
         existing = list(self.model.specialists.keys())
-        if len(existing) > 1:
-            parent = np.random.choice([s for s in existing if s != new_id])
-            self.model.graph.add_edge(parent, new_id, weight=1.0)
+        
+        if not existing: 
+            in_c = 1
+            parent = None
+        else:
+            parent = np.random.choice(existing)
+            in_c = self.model.specialists[parent].out_channels
+        
+        new_id = self.model.add_specialist(in_c, out_channels)
+        
+        if parent: self.model.graph.add_edge(parent, new_id, weight=1.0)
             
-        print(f"Specialist {new_id} Added")
+        print(f"Specialist {new_id} Added (Input: {in_c}, Output: {out_channels})")
         return new_id
     
     def mutate_add_connection(self):
@@ -335,7 +342,7 @@ class EvolutionaryTrainer:
         if np.random.random() < mutation_prob * 0.3:
             channels = [64, 128, 256, 512]
             out_c = np.random.choice(channels)
-            self.mutate_add_specialist(in_channels=1, out_channels=out_c)
+            self.mutate_add_specialist(out_channels=out_c)
             
         if np.random.random() < mutation_prob * 0.5: self.mutate_add_connection()
         
@@ -479,9 +486,10 @@ for epoch in range(num_epochs):
 	f1 = f1_score(y_true, y_pred, average='micro')
 	evolution_trainer.adapt_diversity_pressure(f1)
  
-	if epoch > 5 and epoch % 3 == 0:
+	if epoch > 1 and epoch % 3 == 0:
 		print("\n Evolution Step")
 		evolution_trainer.evolve()
+		optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 		stats = model.get_architecture_stats()
 		print(f"Architecture: {stats['num_specialists']} specialists, "
