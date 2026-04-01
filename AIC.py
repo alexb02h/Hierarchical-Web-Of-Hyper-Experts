@@ -1,3 +1,11 @@
+import sys
+from unittest.mock import MagicMock
+
+# Create a fake torchcodec module so torchaudio skips the FFmpeg check
+mock_torchcodec = MagicMock()
+sys.modules["torchcodec"] = mock_torchcodec
+sys.modules["torchcodec.decoders"] = mock_torchcodec
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +31,6 @@ import random
 
 #1D Convolution -> Batch-Norm -> ReLU -> max_pool
 #Changes channels from in to out, while reducing temporal length by pool_size
-
 class SampleCNNBlock(nn.Module):
 	def __init__(self, in_channels, out_channels, kernel_size=3,pool_size=3):
 		super(SampleCNNBlock, self).__init__()
@@ -33,25 +40,10 @@ class SampleCNNBlock(nn.Module):
 		self.pool = nn.MaxPool1d(pool_size)
 
 	def forward(self, x): 
-		'''
-
-		Input : (N, in_channels, L_in) 
-
-		After Conv1D : (N, out_channels, L_in)
-
-		After BatchNorm1D and Relu: shape unchanged
-
-		After MaxPool1D: (N, out_channels, L_out) where L_out = floor(L_in / pool_size)
-
-		'''
-
 		x = self.pool(self.relu(self.bn(self.conv(x))))
 		return x
 
-
-
 #using a ResidualBlock to use the previous layer in the current layer. Essentially using the output of the SampleCNNBlock and adding to to a 1D convolution that also uses a 1D max pooling function.
-
 class ResidualBlock(nn.Module):
 	def __init__(self, in_channels, out_channels, kernel_size=3, pool_size=3):
 		super(ResidualBlock, self).__init__()
@@ -65,8 +57,6 @@ class ResidualBlock(nn.Module):
 		res = self.residual(F.max_pool1d(x,kernel_size=3))
 		return out + res
 
-
-
 class SqueezeExcite(nn.Module):
 	def __init__(self,channels, reduction=16):
 		super(SqueezeExcite, self).__init__()
@@ -78,8 +68,6 @@ class SqueezeExcite(nn.Module):
 		s = torch.sigmoid(self.fc2(F.relu(self.fc1(z))))
 		s = s.unsqueeze(2)
 		return x * s
-
-
 
 class ReSEBlock(nn.Module):
 	def __init__(self, in_channels, out_channels, kernel_size=3, pool_size=3):
@@ -99,19 +87,33 @@ class AudioSpecialist(nn.Module):
 		self.in_channels = in_channels
 		self.out_channels = out_channels
   
+		self.adapters = nn.ModuleDict()
+  
 		self.processor = ReSEBlock(in_channels,out_channels)
 		self.pool = nn.AdaptiveAvgPool1d(1)
   
 		self.activation_history = []
+		self.gate = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(in_channels,1), nn.Sigmoid())
   
-	def forward(self,x):
-		features = self.processor(x)
-		pooled = self.pool(features).squeeze(2)
+	def forward(self,pred_out : List[torch.Tensor]):
+		aligned_outs = []
+		
+		for i, x in enumerate(pred_out):
+			adapter_key = f"adapter_{x.shape[1]}"
+			if adapter_key not in self.adapters: self.adapters[adapter_key] = nn.Conv1d(x.shape[1], self.in_channels, 1).to(x.device)
+			x_aligned = self.adapters[adapter_key](x)
+			if i > 0 and x_aligned.shape[2] != aligned_outs[0].shape[2]: x_aligned = F.interpolate(x_aligned, size=aligned_outs[0].shape[2], mode='linear', align_corners=False)
+			aligned_outs.append(x_aligned)
+   
+		combined = sum(aligned_outs)
+		gate_value = self.gate(combined).unsqueeze(2)
+		features = self.processor(combined)
+		gated_features = features * gate_value
+		pooled = self.pool(gated_features).squeeze(2)
   
 		self.activation_history.append(pooled.detach().mean(dim=0))
-		if len(self.activation_history) > 100: self.activation_history.pop(0)
-  
-		return features, pooled
+		if len(self.activation_history) > 100 : self.activation_history.pop(0)
+		return gated_features, pooled
 
 	def get_behavioral_signature(self):
 		if not self.activation_history: return torch.zeros(self.out_channels)
@@ -139,6 +141,7 @@ class EvolutionaryAudioGNN(nn.Module):
 	def __init__(self, in_channels=1, num_classes=50, initial_specialists=4):
 		super(EvolutionaryAudioGNN,self).__init__()
         
+		self.needs_reclassification = False
 		self.num_classes = num_classes
 		self.specialist_id_counter = 0
         
@@ -147,25 +150,27 @@ class EvolutionaryAudioGNN(nn.Module):
 		self.graph = nx.DiGraph()
 		self.specialists = nn.ModuleDict()
 		self.coupling_matrix = {}
-        
-		channels = [64, 128, 256, 512]
-		prev_c = in_channels
-        
-		for c in channels: 
-			self.add_specialist(prev_c, c)
-			prev_c = c
-   
-		spec_ids = list(self.specialists.keys())
-		for i in range(len(spec_ids) - 1):  self.graph.add_edge(spec_ids[i], spec_ids[i+1], weight=1.0)
-  
-		total_features = sum(channels)
-		self.classifier = nn.Linear(total_features, num_classes)
-	
+
+		prev_id = self.add_specialist(in_channels=1, out_channels=64)
+		for _ in range(initial_specialists - 1):
+			new_id = self.add_specialist(in_channels=64, out_channels=64)
+			self.graph.add_edge(prev_id, new_id, weight=1.0)
+			if not nx.is_directed_acyclic_graph(self.graph): self.graph.remove_edge(prev_id,new_id)
+			prev_id = new_id
+
+		total_initial_channels = 64 * initial_specialists
+		self.classifier = nn.Linear(total_initial_channels, num_classes)
+ 
 	def add_specialist(self, in_channels, out_channels):
 		spec_id = f"spec_{self.specialist_id_counter}"
 		self.specialist_id_counter += 1
+		self.needs_reclassification = False
   
 		specialist = AudioSpecialist(spec_id, in_channels, out_channels) 
+  
+		device = next(self.parameters()).device
+		specialist.to(device)
+  
 		print("Womp Womp")
 		self.specialists[spec_id] = specialist
 		self.graph.add_node(spec_id, channels=out_channels) 
@@ -178,19 +183,26 @@ class EvolutionaryAudioGNN(nn.Module):
   
 		for spec_id in nx.topological_sort(self.graph):
 			specialist = self.specialists[spec_id]
-   
 			predecessors = list(self.graph.predecessors(spec_id))
 
-			if not predecessors: spec_input = x
-			else:
-				pred_outputs = [specialist_outputs[pred] for pred in predecessors]
-				spec_input = pred_outputs[-1]
-    
-			features, pooled = specialist(spec_input)
+			inputs = [x] if not predecessors else [specialist_outputs[p] for p in predecessors]
+			features, pooled = specialist(inputs)
 			specialist_outputs[spec_id] = features
 			pooled_features.append(pooled)
    
-		combined = torch.cat(pooled_features, dim=1)
+		combined = torch.cat(pooled_features,dim=1)
+		if combined.shape[1] != self.classifier.in_features:
+			old_classifier = self.classifier
+			new_in = combined.shape[1]
+			old_in = old_classifier.in_features
+   
+			self.classifier = nn.Linear(new_in, self.num_classes).to(x.device)
+   
+			with torch.no_grad():
+				self.classifier.weight[:,:old_in] = old_classifier.weight
+				self.classifier.bias.copy_(old_classifier.bias)
+			print(f"Weights stitched: Kept {old_in} existing feature mappings.")
+   
 		return self.classifier(combined)
 
 	def measure_specialist_similarity(self, spec_id1, spec_id2):
@@ -198,6 +210,7 @@ class EvolutionaryAudioGNN(nn.Module):
 		sig2 = self.specialists[spec_id2].get_behavioral_signature()
 
 		if sig1.shape != sig2.shape: return 0.0
+		sig1 = sig1.to(sig2.device)
 
 		similarity = F.cosine_similarity(sig1.unsqueeze(0), sig2.unsqueeze(0))
 		return similarity.item()
@@ -253,13 +266,21 @@ class MagnaTagATuneDataset(Dataset):
 	def __len__(self): return len(self.entries)
 
 	def __getitem__(self, idx):
+		import soundfile as sf
 		path, labels = self.entries[idx]
-		waveform, sr = torchaudio.load(path)
+  
+		data, sr = sf.read(path)
+		waveform = torch.from_numpy(data).float()
 
-		if sr != self.sample_rate:
-			resampler = torchaudio.transforms.Resample(orig_freq=sr,new_freq=self.sample_rate)
+		if waveform.ndim == 1: waveform = waveform.unsqueeze(0)
+		elif waveform.ndim == 0: waveform = waveform.transpose(0,1)
+
+		if int(sr) != int(self.sample_rate):
+			resampler = torchaudio.transforms.Resample(orig_freq=int(sr),new_freq=int(self.sample_rate))
 			waveform = resampler(waveform)
+   
 		if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
+  
 		if waveform.shape[1] < self.window_size:
 			pad_amount = self.window_size - waveform.shape[1]
 			if pad_amount > 0: waveform = F.pad(waveform,(0,pad_amount), mode='constant', value=0)
@@ -267,8 +288,6 @@ class MagnaTagATuneDataset(Dataset):
 			max_offset = waveform.shape[1] - self.window_size
 			start = random.randint(0, max_offset)
 			waveform = waveform[:, start:start + self.window_size]
-
-		if self.transform: waveform = self.transform(waveform)
 
 		return waveform, torch.tensor(labels, dtype=torch.float32)
 
@@ -280,6 +299,10 @@ class EvolutionaryTrainer:
         self.stagnation_counter = 0
         self.diversity_pressure = 0.5
         
+    def get_specialist_fitness(self):
+        try : return nx.eigenvector_centrality_numpy(self.model.graph)
+        except: return nx.degree_centrality(self.model.graph)
+
     def is_stuck(self, patience=5, threshold=0.01):
         if len(self.performance_history) < patience: return False
         
@@ -288,21 +311,34 @@ class EvolutionaryTrainer:
         
         return improvement < threshold
     
-    def mutate_add_specialist(self, out_channels):
+    def mutate_new_entry(self):
+        new_id = self.model.add_specialist(in_channels=1, out_channels=64)
+        for m in self.model.specialists[new_id].modules():
+            if isinstance(m, nn.Conv1d): 
+                m.kernel_size = (7,)
+                m.padding = (3,)
+        
+        existing = [n for n, d in self.model.graph.nodes(data=True) if d.get('channels') == 64]
+        if existing:
+            target = random.choice(existing) 
+            self.model.graph.add_edge(new_id, peer, relation='same_hierarchy')
+            if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(new_id,peer)
+
+    
+    def mutate_add_specialist(self, parent_id):
         existing = list(self.model.specialists.keys())
         
-        if not existing: 
-            in_c = 1
-            parent = None
-        else:
-            parent = np.random.choice(existing)
-            in_c = self.model.specialists[parent].out_channels
+        if not existing: return
+        if parent_id is None: parent_id = np.random.choice(existing)
         
-        new_id = self.model.add_specialist(in_c, out_channels)
+        parent_spec = self.model.specialists[parent_id]
         
-        if parent: self.model.graph.add_edge(parent, new_id, weight=1.0)
-            
-        print(f"Specialist {new_id} Added (Input: {in_c}, Output: {out_channels})")
+        new_channels = min(parent_spec.out_channels * 2, 512)
+        new_id = self.model.add_specialist(parent_spec.out_channels, new_channels)
+        self.model.graph.add_edge(parent_id, new_id, relation='controller')
+        if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(parent_id,new_id)
+        
+        print(f"Promoted: {parent_id} ({parent_out}c) -> spawned Child {new_id} ({new_channels}c)")
         return new_id
     
     def mutate_add_connection(self):
@@ -315,16 +351,32 @@ class EvolutionaryTrainer:
                 self.model.graph.add_edge(src, dst, weight=1.0)
                 if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(src,dst)
                 else:
-                    print(f"Added edge {src} -> {dst}")
+                    print(f"Added edge {src} {src.shape[1]} channels -> {dst} {dst.shape[1]}")
                     return
                 
     def mutate_remove_specialist(self):
-        if len(self.model.specialists) <= 2: return
+        spec_ids = list(self.model.specialists.keys())
+        if len(spec_ids) <= 2: return
         
-        spec_id = np.random.choice(list(self.model.specialists.keys()))
-        self.model.graph.remove_node(spec_id)
-        del self.model.specialists[spec_id]
-        print(f"Specialists {spec_id} Removed")
+        candidates = [s for s in spec_ids if s not in ['spec_0','spec_1']]
+        if not candidates: return
+        
+        weakest_spec = min(candidates, key=lambda s: self.model.graph.out_degree(s))
+        
+        print(f"Pruning Weak Expert: {weakest_spec} (Fitness {scores.get(weakest_spec,0):.4})")
+        
+        preds = list(self.model.graph.predecessors(weakest_spec))
+        succs = list(self.model.graph.successors(weakest_spec))
+        for p in preds:
+            for s in succs:
+                if not self.model.graph.has_edge(p,s): 
+                    self.model.graph.add_edge(p,s,weight=1.0)
+                    if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(p,s)
+
+                
+        self.model.graph.remove_node(weakest_spec)
+        del self.model.specialists[weakest_spec]
+        self.model.needs_reclassification = True
         
     def adapt_diversity_pressure(self, current_f1):
         self.performance_history.append(current_f1)
@@ -333,16 +385,27 @@ class EvolutionaryTrainer:
             self.stagnation_counter += 1
             self.diversity_pressure = min(1.0, self.diversity_pressure + 0.1)
         else:
-            self.stagnation_counter = 0
             self.diversity_pressure = max(0.2, self.diversity_pressure - 0.05)
             
-    def evolve(self):
-        mutation_prob = self.diversity_pressure
+    def evolve(self, current_epoch):
+        if current_epoch % 5 != 0:  return
         
+        if self.stagnation_counter >= 3:
+            new_id = self.mutate_new_entry()
+            self.stagnation_counter = 0
+            return
+        
+        mutation_prob = self.diversity_pressure
         if np.random.random() < mutation_prob * 0.3:
-            channels = [64, 128, 256, 512]
-            out_c = np.random.choice(channels)
-            self.mutate_add_specialist(out_channels=out_c)
+            existing = list(self.model.specialist.keys())
+            parent = np.random.choice(existing)
+            p_out = self.model.specialist[parent].out_channels
+            
+            new_c = min(p_out * 2, 512)
+            new_id = self.model.add_specialist(in_channels=new_c, out_channels=new_c)
+            self.model.graph.add_edge(parent, new_id, weight=1.0)
+            if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(parent,new_id)
+            print(f"Evolved Child: {parent}({p_out}c) -> {new_id}({new_c}c)")
             
         if np.random.random() < mutation_prob * 0.5: self.mutate_add_connection()
         
@@ -365,13 +428,10 @@ print("Labels:", labels)
 val_ratio = 0.2
 val_size = int(len(dataset) * val_ratio)
 train_size = len(dataset) - val_size
-
 indices = np.arange(len(dataset))
 train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42, shuffle=True)
-
 train_dataset = Subset(dataset, train_indices.tolist())
 val_dataset = Subset(dataset, val_indices.tolist())
-
 train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
 
@@ -433,7 +493,7 @@ criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
 
 evolution_trainer = EvolutionaryTrainer(model,device)
 
-num_epochs = 30 
+num_epochs = 100
 best_f1 = 0.0
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
@@ -488,7 +548,7 @@ for epoch in range(num_epochs):
  
 	if epoch > 1 and epoch % 3 == 0:
 		print("\n Evolution Step")
-		evolution_trainer.evolve()
+		evolution_trainer.evolve(epoch)
 		optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 		stats = model.get_architecture_stats()
