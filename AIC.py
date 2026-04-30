@@ -1,24 +1,21 @@
 import sys
 from unittest.mock import MagicMock
-
+from audiomentations import Compose, AddGaussianNoise, Shift, PitchShift
+from scan import PhaseManager
 # Create a fake torchcodec module so torchaudio skips the FFmpeg check
 mock_torchcodec = MagicMock()
 sys.modules["torchcodec"] = mock_torchcodec
 sys.modules["torchcodec.decoders"] = mock_torchcodec
-
+manager = PhaseManager("Dataset/annotations_final.csv")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-from torch.utils.data import random_split
-from torch.utils.data import Subset
+from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from skmultilearn.model_selection import iterative_train_test_split
 from tqdm import tqdm
 from sklearn.metrics import f1_score
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import KFold
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.utils.class_weight import compute_class_weight
 from typing import List, Dict, Tuple
 import librosa
@@ -28,6 +25,12 @@ import numpy as np
 import networkx as nx
 import copy
 import random
+
+phases = [
+	["vocals", "instrumental", "no voice"],
+	["guitar", "piano", "drums", "synth"],
+	["rock", "jazz", "classical", "electronic"]
+]
 
 #1D Convolution -> Batch-Norm -> ReLU -> max_pool
 #Changes channels from in to out, while reducing temporal length by pool_size
@@ -50,11 +53,12 @@ class ResidualBlock(nn.Module):
 		self.main = SampleCNNBlock(in_channels, out_channels, kernel_size, pool_size)
 		self.residual = nn.Conv1d(in_channels, out_channels, kernel_size = 1) if in_channels != out_channels else nn.Identity()
 
-
-
 	def forward(self,x):
 		out = self.main(x)
-		res = self.residual(F.max_pool1d(x,kernel_size=3))
+		res = F.max_pool1d(x, kernel_size=3)
+		res = self.residual(res)
+  
+		if out.shape[2] != res.shape[2]:  res = F.interpolate(res, size=out.shape[2], mode='linear', align_corners=False)
 		return out + res
 
 class SqueezeExcite(nn.Module):
@@ -93,7 +97,8 @@ class AudioSpecialist(nn.Module):
 		self.pool = nn.AdaptiveAvgPool1d(1)
   
 		self.activation_history = []
-		self.gate = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(in_channels,1), nn.Sigmoid())
+		self.gate = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(in_channels, in_channels//2), nn.ReLU(inplace=True), nn.Linear(in_channels//2, 1), nn.Sigmoid())
+		self.last_input = None
   
 	def forward(self,pred_out : List[torch.Tensor]):
 		aligned_outs = []
@@ -106,6 +111,7 @@ class AudioSpecialist(nn.Module):
 			aligned_outs.append(x_aligned)
    
 		combined = sum(aligned_outs)
+		self.last_input = combined.detach()
 		gate_value = self.gate(combined).unsqueeze(2)
 		features = self.processor(combined)
 		gated_features = features * gate_value
@@ -254,13 +260,10 @@ class MagnaTagATuneDataset(Dataset):
 		for idx, row in self.annotations.iterrows():
 			mp3_path = row['mp3_path']
 			wav_path = mp3_path.replace('.mp3','.wav')
-
 			full_path = os.path.join(audio_dir,wav_path)
 
 			if os.path.exists(full_path):
-
 				labels = row[self.tag_columns].values.astype(np.float32)
-
 				self.entries.append((full_path, labels))
 
 	def __len__(self): return len(self.entries)
@@ -270,6 +273,7 @@ class MagnaTagATuneDataset(Dataset):
 		path, labels = self.entries[idx]
   
 		data, sr = sf.read(path)
+		if self.transform: data = self.transform(samples=data.astype(np.float32), sample_rate=sr)
 		waveform = torch.from_numpy(data).float()
 
 		if waveform.ndim == 1: waveform = waveform.unsqueeze(0)
@@ -321,24 +325,23 @@ class EvolutionaryTrainer:
         existing = [n for n, d in self.model.graph.nodes(data=True) if d.get('channels') == 64]
         if existing:
             target = random.choice(existing) 
-            self.model.graph.add_edge(new_id, peer, relation='same_hierarchy')
-            if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(new_id,peer)
-
-    
+            self.model.graph.add_edge(new_id, target, relation='same_hierarchy')
+            if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(new_id,target)
+   
     def mutate_add_specialist(self, parent_id):
         existing = list(self.model.specialists.keys())
         
         if not existing: return
         if parent_id is None: parent_id = np.random.choice(existing)
         
-        parent_spec = self.model.specialists[parent_id]
+        parent_spec = self.model.specialists[parent_id].to(device )
         
         new_channels = min(parent_spec.out_channels * 2, 512)
         new_id = self.model.add_specialist(parent_spec.out_channels, new_channels)
         self.model.graph.add_edge(parent_id, new_id, relation='controller')
         if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(parent_id,new_id)
         
-        print(f"Promoted: {parent_id} ({parent_out}c) -> spawned Child {new_id} ({new_channels}c)")
+        print(f"Promoted: {parent_id} ({parent_spec.out_channels}c) -> spawned Child {new_id} ({new_channels}c)")
         return new_id
     
     def mutate_add_connection(self):
@@ -351,19 +354,22 @@ class EvolutionaryTrainer:
                 self.model.graph.add_edge(src, dst, weight=1.0)
                 if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(src,dst)
                 else:
-                    print(f"Added edge {src} {src.shape[1]} channels -> {dst} {dst.shape[1]}")
+                    src_channels = self.model.specialists[src]
+                    dst_channels = self.model.specialists[dst]
+                    
+                    print(f"Added edge {src} ({self.model.specialists[src].out_channels}c) -> {dst} ({self.model.specialists[dst].in_channels}c)")
                     return
                 
-    def mutate_remove_specialist(self):
+    def mutate_remove_specialist(self, scores_dict):
         spec_ids = list(self.model.specialists.keys())
         if len(spec_ids) <= 2: return
         
-        candidates = [s for s in spec_ids if s not in ['spec_0','spec_1']]
+        candidates = [s for s in spec_ids if s not in ['spec_0','spec_1', 'spec_2', 'spec_3']]
         if not candidates: return
         
-        weakest_spec = min(candidates, key=lambda s: self.model.graph.out_degree(s))
+        weakest_spec = min(candidates, key=lambda s: scores_dict.get(s, float('inf')))
         
-        print(f"Pruning Weak Expert: {weakest_spec} (Fitness {scores.get(weakest_spec,0):.4})")
+        print(f"Pruning Weak Expert: {weakest_spec} (Fitness {scores_dict.get(weakest_spec,0):.4})")
         
         preds = list(self.model.graph.predecessors(weakest_spec))
         succs = list(self.model.graph.successors(weakest_spec))
@@ -372,8 +378,7 @@ class EvolutionaryTrainer:
                 if not self.model.graph.has_edge(p,s): 
                     self.model.graph.add_edge(p,s,weight=1.0)
                     if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(p,s)
-
-                
+    
         self.model.graph.remove_node(weakest_spec)
         del self.model.specialists[weakest_spec]
         self.model.needs_reclassification = True
@@ -386,50 +391,59 @@ class EvolutionaryTrainer:
             self.diversity_pressure = min(1.0, self.diversity_pressure + 0.1)
         else:
             self.diversity_pressure = max(0.2, self.diversity_pressure - 0.05)
-            
+
     def evolve(self, current_epoch):
-        if current_epoch % 5 != 0:  return
-        
-        if self.stagnation_counter >= 3:
+        if self.stagnation_counter >= 2:
             new_id = self.mutate_new_entry()
             self.stagnation_counter = 0
             return
-        
+
+        current_scores = self.get_specialist_fitness()
         mutation_prob = self.diversity_pressure
-        if np.random.random() < mutation_prob * 0.3:
-            existing = list(self.model.specialist.keys())
+
+        if np.random.random() < mutation_prob * 0.7:
+            existing = list(self.model.specialists.keys())
             parent = np.random.choice(existing)
-            p_out = self.model.specialist[parent].out_channels
-            
-            new_c = min(p_out * 2, 512)
-            new_id = self.model.add_specialist(in_channels=new_c, out_channels=new_c)
-            self.model.graph.add_edge(parent, new_id, weight=1.0)
-            if not nx.is_directed_acyclic_graph(self.model.graph): self.model.graph.remove_edge(parent,new_id)
-            print(f"Evolved Child: {parent}({p_out}c) -> {new_id}({new_c}c)")
-            
+            self.mutate_add_specialist(parent)
+
         if np.random.random() < mutation_prob * 0.5: self.mutate_add_connection()
-        
-        if np.random.random() < mutation_prob * 0.2: self.mutate_remove_specialist()
-        
+
+        if np.random.random() < mutation_prob * 0.2: self.mutate_remove_specialist(current_scores)
         self.model.update_coupling()
+
+def masked_bce_loss(outputs, targets, active_indices):
+	mask_outputs = outputs[:, active_indices]
+	mask_targets = targets[:, active_indices]
+	return F.binary_cross_entropy_with_logits(mask_outputs, mask_targets)
 
 dataset = MagnaTagATuneDataset(
 	audio_dir='Dataset/wav_combined',
 	annotations_file='Dataset/annotations_final.csv',
 	clip_info_file='Dataset/clip_info.csv',
 	sample_rate=16000,
-	window_size=3.0
+	window_size=3.0,
+	transform=None
+)
+
+augmented_dataset = MagnaTagATuneDataset(
+	audio_dir='Dataset/wav_combined',
+	annotations_file='Dataset/annotations_final.csv',
+	clip_info_file='Dataset/clip_info.csv',
+	sample_rate=16000,
+	window_size=3.0,
+	transform=None
 )
 
 waveform, labels = dataset[0]
 print("Waveform shape:", waveform.shape)
 print("Labels:", labels)
 
-val_ratio = 0.2
-val_size = int(len(dataset) * val_ratio)
+val_size = int(len(dataset) * 0.2)
 train_size = len(dataset) - val_size
+
 indices = np.arange(len(dataset))
 train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42, shuffle=True)
+
 train_dataset = Subset(dataset, train_indices.tolist())
 val_dataset = Subset(dataset, val_indices.tolist())
 train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
@@ -448,14 +462,15 @@ for batch_waveforms, batch_labels in train_loader:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = EvolutionaryAudioGNN(in_channels=1, num_classes=dataset[0][1].shape[0]).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 def compute_pos_weights(dataset):
 	labels = [label for _, label in dataset]
 	label_matrix = torch.stack(labels)
 	pos_counts = label_matrix.sum(dim=0)
 	neg_counts = label_matrix.shape[0] - pos_counts
-	weights = torch.log1p(neg_counts / (pos_counts + 1e-5)) * 2.0 #added multiplication of the function by 2
+	weights = torch.log1p(neg_counts / (pos_counts + 1e-6)) * 2.0 #added multiplication of the function by 2
+	weights = torch.clamp(weights, min=0.1, max=10.0)
 	weights /= weights.mean()
 	return weights
 
@@ -473,7 +488,7 @@ def find_optimal_thresholds(y_true, y_scores,n_splits=3 ,num_thresholds=50):
 		best_threshold = 0.5
 		best_f1 = 0.0
 
-		thresholds = np.linspace(0.1,0.9,num_thresholds)
+		thresholds = np.linspace(0.1, 0.9, num_thresholds)
 
 		for threshold in thresholds:
 			f1_scores = []
@@ -493,78 +508,128 @@ criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
 
 evolution_trainer = EvolutionaryTrainer(model,device)
 
-num_epochs = 100
+num_epochs = 1000
 best_f1 = 0.0
+stagnating = 0
+mutation_patience = 5
+cooldown = 5
+cooldown_counter = 0
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
 
-for epoch in range(num_epochs):
-	model.train()
+for phase_labels in phases:
+	active_idx = manager.get_indices(phase_labels)
+	active_idxt = torch.tensor(active_idx, dtype=torch.long).to(device)
 
-	total_loss = 0
-	for waveforms, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
-		waveforms = waveforms.to(device)
-		labels = labels.to(device)
+	print(f"Training labels: {phase_labels}")
 
-		outputs = model(waveforms)
-		loss = criterion(outputs, labels)
-
-		optimizer.zero_grad()
-		loss.backward()
-		optimizer.step()
-
-		total_loss += loss.item()
-		
-	avg_train_loss = total_loss / len(train_loader)
-	
-	model.eval()
-	val_loss = 0
-	all_preds, all_targets = [], []
-
-	with torch.no_grad():
-		for waveforms, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation"):
+	for epoch in range(num_epochs):
+		model.train()
+		total_loss = 0
+		for waveforms, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
 			waveforms = waveforms.to(device)
 			labels = labels.to(device)
 
+			optimizer.zero_grad()
 			outputs = model(waveforms)
-			loss = criterion(outputs, labels)
-			val_loss += loss.item()
+			outputs = torch.clamp(outputs, -20, 20)
 
-			preds = torch.sigmoid(outputs).cpu().numpy()
-			targets = labels.cpu().numpy()
-			all_preds.append(preds)
-			all_targets.append(targets)
-	avg_val_loss = val_loss / len(val_loader)
+			phase_logits = outputs.index_select(1, active_idxt)
+			phase_targets = labels.index_select(1, active_idxt)
+			phase_weight = pos_weights[active_idxt]
+			loss = F.binary_cross_entropy_with_logits(phase_logits, phase_targets, pos_weight=phase_weight)
 
-	y_true = np.concatenate(all_targets)
-	y_scores = np.concatenate(all_preds)
-	optimal_thresholds = find_optimal_thresholds(y_true, y_scores, n_splits=3)
-	y_pred = np.zeros_like(y_scores)
+			gate_penalty = 0
+			for spec in model.specialists.values(): 
+				if spec.last_input is not None:
+					if torch.isnan(spec.last_input).any(): continue
+					gate_values = torch.clamp(spec.gate(spec.last_input), 1e-6, 1 - 1e-6)
+					gate_penalty += torch.mean(gate_values * (1 - gate_values))
 
-	for tag_idx in range(y_scores.shape[1]): y_pred[:,tag_idx] = (y_scores[:,tag_idx] >= optimal_thresholds[tag_idx]).astype(int)
+			loss = loss + 0.01 * gate_penalty
+
+			if torch.isnan(loss): continue
+
+			loss.backward()
+			torch.nn.utils.clip_grad_norm(model.parameters(), max_norm=1.0)
+			optimizer.step()
+			total_loss += loss.item()
+
+		avg_train_loss = total_loss / len(train_loader)
 	
-	f1 = f1_score(y_true, y_pred, average='micro')
-	evolution_trainer.adapt_diversity_pressure(f1)
- 
-	if epoch > 1 and epoch % 3 == 0:
-		print("\n Evolution Step")
-		evolution_trainer.evolve(epoch)
-		optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+		model.eval()
+		val_loss = 0
+		all_preds, all_targets = [], []
 
-		stats = model.get_architecture_stats()
-		print(f"Architecture: {stats['num_specialists']} specialists, "
-              f"{stats['num_edges']} edges, "
-              f"{stats['num_coupled_pairs']} coupled pairs")
-  
-	print(f"Epoch [{epoch + 1}/{num_epochs} |  Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f} | F1 Score: {f1:.4f} | Diversity: {evolution_trainer.diversity_pressure:.2f}")
+		with torch.no_grad():
+			for waveforms, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation"):
+				waveforms = waveforms.to(device)
+				labels = labels.to(device)
+
+				outputs = model(waveforms)
+				loss = criterion(outputs, labels)
+				val_loss += loss.item()
+
+				preds = torch.sigmoid(outputs).cpu().numpy()
+				targets = labels.cpu().numpy()
+				all_preds.append(preds)
+				all_targets.append(targets)
+		avg_val_loss = val_loss / len(val_loader)
+
+		y_true = np.concatenate(all_targets)
+		y_scores = np.concatenate(all_preds)
+		optimal_thresholds = find_optimal_thresholds(y_true, y_scores, n_splits=3)
+		y_pred = np.zeros_like(y_scores)
+
+		for tag_idx in range(y_scores.shape[1]): y_pred[:,tag_idx] = (y_scores[:,tag_idx] >= optimal_thresholds[tag_idx]).astype(int)
+
+		f1 = f1_score(y_true, y_pred, average='micro')
+		evolution_trainer.adapt_diversity_pressure(f1)
  
-	if f1 > best_f1:
-		best_f1 = f1
-		torch.save({
-			'epoch' : epoch + 1,
-			'model_state_dict' : model.state_dict(),
-			'optimizer_state_dict' : optimizer.state_dict(),
-			'f1': f1,
-			'architecture' : model.get_architecture_stats()
-		}, 'evolutionary_checkpoint.pth')
-		print(f"Model saved with F1: {f1:.4f}")
+		if f1 > best_f1:
+			if f1 > best_f1 + 1e-3:
+				print(f"Significant improvement detected: {f1:.4f} > {best_f1:.4f}")
+				stagnating = 0
+   
+			best_f1 = f1
+			torch.save({
+				'epoch' : epoch + 1,
+				'model_state_dict' : model.state_dict(),
+				'optimizer_state_dict' : optimizer.state_dict(),
+				'f1': f1,
+				'architecture' : model.get_architecture_stats()
+			}, 'evolutionary_checkpoint.pth')
+			print(f"Model saved with F1: {f1:.4f} | Stagnation: {stagnating}")
+		else: stagnating += 1
+
+		if cooldown_counter > 0:
+			cooldown_counter -= 1
+			print(f"--- Cooldown active: {cooldown_counter} epochs remaining ---")
+		if epoch > 1 and stagnating >= mutation_patience:
+			print(f"\n--- Stagnation Detected (Patience {mutation_patience}) -> Evolution Step ---")		
+			old_ids = set(model.specialists.keys())
+			evolution_trainer.evolve(epoch)
+			new_ids = set(model.specialists.keys()) - old_ids
+  
+			optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+			scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+			stagnating = 0
+			cooldown_counter = cooldown
+
+			stats = model.get_architecture_stats()
+			print(f"Architecture: {stats['num_specialists']} specialists, "
+				f"{stats['num_edges']} edges, "
+              			f"{stats['num_coupled_pairs']} coupled pairs")
+  
+		print(f"Epoch [{epoch + 1}/{num_epochs} |  Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f} | F1 Score: {f1:.4f} | Diversity: {evolution_trainer.diversity_pressure:.2f}")
+ 
+		if f1 > best_f1:
+			best_f1 = f1
+			torch.save({
+				'epoch' : epoch + 1,
+				'model_state_dict' : model.state_dict(),
+				'optimizer_state_dict' : optimizer.state_dict(),
+				'f1': f1,
+				'architecture' : model.get_architecture_stats()
+			}, 'evolutionary_checkpoint.pth')
+			print(f"Model saved with F1: {f1:.4f}")
