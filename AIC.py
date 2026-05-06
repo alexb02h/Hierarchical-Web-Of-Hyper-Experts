@@ -25,6 +25,13 @@ import numpy as np
 import networkx as nx
 import copy
 import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+os.makedirs("feature_maps", exist_ok=True)
+os.makedirs("plots", exist_ok=True)
+
+history ={ 'train_loss' : [], 'val_loss' : [], 'f1_score' : [], 'epochs' : []}
 
 phases = [
 	["vocals", "instrumental", "no voice"],
@@ -114,6 +121,7 @@ class AudioSpecialist(nn.Module):
 		self.last_input = combined.detach()
 		gate_value = self.gate(combined).unsqueeze(2)
 		features = self.processor(combined)
+		self.last_feature_map = features.detach()
 		gated_features = features * gate_value
 		pooled = self.pool(gated_features).squeeze(2)
   
@@ -205,7 +213,8 @@ class EvolutionaryAudioGNN(nn.Module):
 			self.classifier = nn.Linear(new_in, self.num_classes).to(x.device)
    
 			with torch.no_grad():
-				self.classifier.weight[:,:old_in] = old_classifier.weight
+				copy_size = min(new_in, old_in)
+				self.classifier.weight[:,:copy_size] = old_classifier.weight[:, :copy_size]
 				self.classifier.bias.copy_(old_classifier.bias)
 			print(f"Weights stitched: Kept {old_in} existing feature mappings.")
    
@@ -446,8 +455,8 @@ train_indices, val_indices = train_test_split(indices, test_size=0.2, random_sta
 
 train_dataset = Subset(dataset, train_indices.tolist())
 val_dataset = Subset(dataset, val_indices.tolist())
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
 print(f"Train set size: {len(train_dataset)}")
 print(f"Val set size:   {len(val_dataset)}")
@@ -462,7 +471,7 @@ for batch_waveforms, batch_labels in train_loader:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = EvolutionaryAudioGNN(in_channels=1, num_classes=dataset[0][1].shape[0]).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 def compute_pos_weights(dataset):
 	labels = [label for _, label in dataset]
@@ -515,121 +524,147 @@ mutation_patience = 5
 cooldown = 5
 cooldown_counter = 0
 
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+#scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
 
-for phase_labels in phases:
-	active_idx = manager.get_indices(phase_labels)
-	active_idxt = torch.tensor(active_idx, dtype=torch.long).to(device)
+def save_graph_visualization(model, epoch):
+	plt.figure(figsize=(10, 8))
+	pos = nx.spring_layout(model.graph)
+	nx.draw(model.graph, pos, with_labels=True, node_color='skyblue', node_size=2000, edge_color='gray', arrows=True)
+	plt.title(f"Architecture Graph - Epoch {epoch}")
+	plt.savefig(f"plots/graph_epoch_{epoch}.png")
+	plt.close()
 
-	print(f"Training labels: {phase_labels}")
+for epoch in range(num_epochs):
+	model.train()
+	total_loss = 0
+	for waveforms, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
+		waveforms = waveforms.to(device)
+		labels = labels.to(device)
 
-	for epoch in range(num_epochs):
-		model.train()
-		total_loss = 0
-		for waveforms, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
+		optimizer.zero_grad()
+		outputs = model(waveforms)
+		loss = criterion(outputs, labels)
+		gate_penalty = 0
+		for spec in model.specialists.values(): 
+			if spec.last_input is not None:
+				if torch.isnan(spec.last_input).any(): continue
+				gate_values = torch.clamp(spec.gate(spec.last_input), 1e-6, 1 - 1e-6)
+				gate_penalty += torch.mean(gate_values * (1 - gate_values))
+		loss = loss + 0.01 * gate_penalty
+
+		if torch.isnan(loss): continue
+
+		loss.backward()
+		torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+		optimizer.step()
+		total_loss += loss.item()
+
+	avg_train_loss = total_loss / len(train_loader)
+	
+	model.eval()
+	val_loss = 0
+	all_preds, all_targets = [], []
+
+	with torch.no_grad():
+		for waveforms, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation"):
 			waveforms = waveforms.to(device)
 			labels = labels.to(device)
 
-			optimizer.zero_grad()
 			outputs = model(waveforms)
-			outputs = torch.clamp(outputs, -20, 20)
+			loss = criterion(outputs, labels)
+			val_loss += loss.item()
 
-			phase_logits = outputs.index_select(1, active_idxt)
-			phase_targets = labels.index_select(1, active_idxt)
-			phase_weight = pos_weights[active_idxt]
-			loss = F.binary_cross_entropy_with_logits(phase_logits, phase_targets, pos_weight=phase_weight)
+			preds = torch.sigmoid(outputs).cpu().numpy()
+			targets = labels.cpu().numpy()
+			all_preds.append(preds)
+			all_targets.append(targets)
+	avg_val_loss = val_loss / len(val_loader)
 
-			gate_penalty = 0
-			for spec in model.specialists.values(): 
-				if spec.last_input is not None:
-					if torch.isnan(spec.last_input).any(): continue
-					gate_values = torch.clamp(spec.gate(spec.last_input), 1e-6, 1 - 1e-6)
-					gate_penalty += torch.mean(gate_values * (1 - gate_values))
+	y_true = np.concatenate(all_targets)
+	y_scores = np.concatenate(all_preds)
+	optimal_thresholds = find_optimal_thresholds(y_true, y_scores, n_splits=3)
+	y_pred = np.zeros_like(y_scores)
 
-			loss = loss + 0.01 * gate_penalty
+	for tag_idx in range(y_scores.shape[1]): y_pred[:,tag_idx] = (y_scores[:,tag_idx] >= optimal_thresholds[tag_idx]).astype(int)
 
-			if torch.isnan(loss): continue
+	f1 = f1_score(y_true, y_pred, average='micro')
+	evolution_trainer.adapt_diversity_pressure(f1)
 
-			loss.backward()
-			torch.nn.utils.clip_grad_norm(model.parameters(), max_norm=1.0)
-			optimizer.step()
-			total_loss += loss.item()
+	history['train_loss'].append(avg_train_loss)
+	history['val_loss'].append(avg_val_loss)
+	history['f1_score'].append(f1)
+	history['epochs'].append(epoch + 1)
 
-		avg_train_loss = total_loss / len(train_loader)
-	
-		model.eval()
-		val_loss = 0
-		all_preds, all_targets = [], []
+	if (epoch + 1) % 10 == 0 : 
+		plt.figure(figsize=(12, 5))
+		plt.subplot(1, 2, 1)
+		plt.plot(history['epochs'], history['train_loss'], label='Train Loss')
+		plt.plot(history['epochs'], history['val_loss'], label='Val Loss')
+		plt.title('Loss History')
+		plt.legend()
 
-		with torch.no_grad():
-			for waveforms, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation"):
-				waveforms = waveforms.to(device)
-				labels = labels.to(device)
+		plt.subplot(1, 2, 2)
+		plt.plot(history['epochs'], history['f1_score'], label='F1 Score', color='green')
+		plt.title('Performance (F1)')
+		plt.legend()
+		plt.savefig(f"plots/training_summary_epoch_{epoch+1}.png")
+		plt.close()
 
-				outputs = model(waveforms)
-				loss = criterion(outputs, labels)
-				val_loss += loss.item()
+		for spec_id, specialist in model.specialists.items():
+			if hasattr(specialist, 'last_feature_map'):
+				f_map = specialist.last_feature_map[0, 0, :].cpu().numpy() # [Time]
+				plt.figure(figsize=(10, 2))
+				plt.plot(f_map)
+				plt.title(f"Expert {spec_id} - Feature Map (Ch 0) - Epoch {epoch+1}")
+				plt.tight_layout()
+				plt.savefig(f"feature_maps/{spec_id}_epoch_{epoch+1}.png")
+				plt.close()
+		save_graph_visualization(model,epoch)
 
-				preds = torch.sigmoid(outputs).cpu().numpy()
-				targets = labels.cpu().numpy()
-				all_preds.append(preds)
-				all_targets.append(targets)
-		avg_val_loss = val_loss / len(val_loader)
-
-		y_true = np.concatenate(all_targets)
-		y_scores = np.concatenate(all_preds)
-		optimal_thresholds = find_optimal_thresholds(y_true, y_scores, n_splits=3)
-		y_pred = np.zeros_like(y_scores)
-
-		for tag_idx in range(y_scores.shape[1]): y_pred[:,tag_idx] = (y_scores[:,tag_idx] >= optimal_thresholds[tag_idx]).astype(int)
-
-		f1 = f1_score(y_true, y_pred, average='micro')
-		evolution_trainer.adapt_diversity_pressure(f1)
- 
-		if f1 > best_f1:
-			if f1 > best_f1 + 1e-3:
-				print(f"Significant improvement detected: {f1:.4f} > {best_f1:.4f}")
-				stagnating = 0
-   
-			best_f1 = f1
-			torch.save({
-				'epoch' : epoch + 1,
-				'model_state_dict' : model.state_dict(),
-				'optimizer_state_dict' : optimizer.state_dict(),
-				'f1': f1,
-				'architecture' : model.get_architecture_stats()
-			}, 'evolutionary_checkpoint.pth')
-			print(f"Model saved with F1: {f1:.4f} | Stagnation: {stagnating}")
-		else: stagnating += 1
-
-		if cooldown_counter > 0:
-			cooldown_counter -= 1
-			print(f"--- Cooldown active: {cooldown_counter} epochs remaining ---")
-		if epoch > 1 and stagnating >= mutation_patience:
-			print(f"\n--- Stagnation Detected (Patience {mutation_patience}) -> Evolution Step ---")		
-			old_ids = set(model.specialists.keys())
-			evolution_trainer.evolve(epoch)
-			new_ids = set(model.specialists.keys()) - old_ids
-  
-			optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-			scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+	if f1 > best_f1:
+		if f1 > best_f1 + 1e-3:
+			print(f"Significant improvement detected: {f1:.4f} > {best_f1:.4f}")
 			stagnating = 0
-			cooldown_counter = cooldown
+   
+		best_f1 = f1
+		torch.save({
+			'epoch' : epoch + 1,
+			'model_state_dict' : model.state_dict(),
+			'optimizer_state_dict' : optimizer.state_dict(),
+			'f1': f1,
+			'architecture' : model.get_architecture_stats()
+		}, 'evolutionary_checkpoint.pth')
+		print(f"Model saved with F1: {f1:.4f}")
+	else: stagnating += 1
 
-			stats = model.get_architecture_stats()
-			print(f"Architecture: {stats['num_specialists']} specialists, "
+	if cooldown_counter > 0:
+		cooldown_counter -= 1
+		print(f"--- Cooldown active: {cooldown_counter} epochs remaining ---")
+	if epoch > 1 and stagnating >= mutation_patience:
+		print(f"\n--- Stagnation Detected (Patience {mutation_patience}) -> Evolution Step ---")		
+		old_ids = set(model.specialists.keys())
+		evolution_trainer.evolve(epoch)
+		new_ids = set(model.specialists.keys()) - old_ids
+  
+		optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+		#scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+		stagnating = 0
+		cooldown_counter = cooldown
+		cooldown += 1
+		stats = model.get_architecture_stats()
+		print(f"Architecture: {stats['num_specialists']} specialists, "
 				f"{stats['num_edges']} edges, "
               			f"{stats['num_coupled_pairs']} coupled pairs")
   
-		print(f"Epoch [{epoch + 1}/{num_epochs} |  Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f} | F1 Score: {f1:.4f} | Diversity: {evolution_trainer.diversity_pressure:.2f}")
+	print(f"Epoch [{epoch + 1}/{num_epochs} |  Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f} | F1 Score: {f1:.4f} | Diversity: {evolution_trainer.diversity_pressure:.2f} | Stagnation : {stagnating:.2f}")
  
-		if f1 > best_f1:
-			best_f1 = f1
-			torch.save({
-				'epoch' : epoch + 1,
-				'model_state_dict' : model.state_dict(),
-				'optimizer_state_dict' : optimizer.state_dict(),
-				'f1': f1,
-				'architecture' : model.get_architecture_stats()
-			}, 'evolutionary_checkpoint.pth')
-			print(f"Model saved with F1: {f1:.4f}")
+	if f1 > best_f1:
+		best_f1 = f1
+		torch.save({
+			'epoch' : epoch + 1,
+			'model_state_dict' : model.state_dict(),
+			'optimizer_state_dict' : optimizer.state_dict(),
+			'f1': f1,
+			'architecture' : model.get_architecture_stats()
+		}, 'evolutionary_checkpoint.pth')
+		print(f"Model saved with F1: {f1:.4f}")
