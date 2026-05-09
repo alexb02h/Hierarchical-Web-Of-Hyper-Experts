@@ -1,0 +1,67 @@
+\usepackage[
+  paperheight=8.5in,
+  paperwidth=5.5in,
+  left=10mm,
+  right=10mm,
+  top=20mm,
+  bottom=20mm]{geometry}
+\usepackage[utf8]{inputenc}
+
+\usepackage{graphicx}
+\usepackage{wrapfig}
+\usepackage[bottom]{footmisc}
+\usepackage{listings}
+\usepackage{enumitem}
+
+\usepackage{wrapfig}
+\usepackage{ragged2e}
+
+\usepackage{array}
+\usepackage[table]{xcolor}
+\usepackage{multirow}
+\usepackage{booktabs}
+\usepackage{hhline}
+\definecolor{palegreen}{rgb}{0.6,0.98,0.6}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{multicol}
+\usepackage{lipsum}
+\usepackage{hyphenat}
+\PassOptionsToPackage{hyphens}{url}
+\usepackage{url}
+
+\usepackage{rotating}
+
+%\usepackage{xeCJK}
+
+%% support use of straight quotes in code listings
+\usepackage[T1]{fontenc}
+\usepackage{textcomp}
+\usepackage{listings}
+\lstset{upquote=true,basicstyle=\small\ttfamily}
+
+%% for shrinking space between lines
+\usepackage{setspace}
+
+\newcommand*{\affaddr}[1]{#1} % No op here. Customize it for different styles.
+\newcommand*{\affmark}[1][*]{\textsuperscript{#1}}
+\newcommand*{\email}[1]{\small{\texttt{#1}}}
+\newcommand{\tarot}{\textsc{Tarot}}
+\renewcommand*\contentsname{\centering Table of Contents}
+
+\renewcommand{\footnoterule}{%
+  \kern -3pt
+  \hrule width \textwidth height 0.5pt
+  \kern 2pt
+}
+
+% remove date
+\date{}
+
+\usepackage{titlesec}
+\titleformat*{\section}{\small\bfseries}
+\titleformat*{\subsection}{\small\bfseries}
+\titleformat*{\subsubsection}{\small\bfseries}
+
+\usepackage{biblatex}
