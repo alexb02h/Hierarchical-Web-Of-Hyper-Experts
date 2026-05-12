@@ -430,7 +430,7 @@ dataset = MagnaTagATuneDataset(
 	annotations_file='Dataset/annotations_final.csv',
 	clip_info_file='Dataset/clip_info.csv',
 	sample_rate=16000,
-	window_size=3.0,
+	window_size=2.0,
 	transform=None
 )
 
@@ -439,7 +439,7 @@ augmented_dataset = MagnaTagATuneDataset(
 	annotations_file='Dataset/annotations_final.csv',
 	clip_info_file='Dataset/clip_info.csv',
 	sample_rate=16000,
-	window_size=3.0,
+	window_size=2.0,
 	transform=None
 )
 
@@ -455,8 +455,8 @@ train_indices, val_indices = train_test_split(indices, test_size=0.2, random_sta
 
 train_dataset = Subset(dataset, train_indices.tolist())
 val_dataset = Subset(dataset, val_indices.tolist())
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
 print(f"Train set size: {len(train_dataset)}")
 print(f"Val set size:   {len(val_dataset)}")
@@ -635,7 +635,7 @@ for epoch in range(num_epochs):
 			'architecture' : model.get_architecture_stats()
 		}, 'evolutionary_checkpoint.pth')
 		print(f"Model saved with F1: {f1:.4f}")
-	else: stagnating += 1
+	else: stagnating += 1 if cooldown_counter == 0 else 0
 
 	if cooldown_counter > 0:
 		cooldown_counter -= 1
